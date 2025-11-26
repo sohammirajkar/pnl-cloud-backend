@@ -14,13 +14,18 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# --- SAFE MOUNT ---
-# Ensure the directory exists before mounting to prevent crash
-if not os.path.exists("public"):
-    os.makedirs("public")
+# --- CRASH PROOF MOUNT ---
+# 1. Get the absolute path to the folder (safer for cloud environments)
+script_dir = os.path.dirname(__file__)
+public_path = os.path.join(script_dir, "public")
 
-app.mount("/public", StaticFiles(directory="public"), name="public")
-# ----------------------
+# 2. Create directory if it doesn't exist (prevents Startup Crash)
+if not os.path.exists(public_path):
+    os.makedirs(public_path)
+
+# 3. Mount it
+app.mount("/public", StaticFiles(directory=public_path), name="public")
+# -------------------------
 
 # CORS
 app.add_middleware(
