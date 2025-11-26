@@ -7,11 +7,17 @@ from database import SessionLocal, engine, Base
 from models import TradeLogDB, TelemetryDB
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
+from fastapi.staticfiles import StaticFiles
 
 # Initialize Database
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+# --- ADD THIS BLOCK ---
+# This tells FastAPI: "If someone asks for /public, look in the 'public' folder"
+app.mount("/public", StaticFiles(directory="public"), name="public")
+# ----------------------
 
 # CORS
 app.add_middleware(
