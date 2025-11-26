@@ -376,7 +376,7 @@ prometheus-client @ file:///Users/cbousseau/work/recipes/ci_py311_2/prometheus_c
 prompt-toolkit @ file:///private/var/folders/k1/30mswbxs7r1g6zwn8y4fyt500000gp/T/abs_c63v4kqjzr/croot/prompt-toolkit_1704404354115/work
 Protego @ file:///tmp/build/80754af9/protego_1598657180827/work
 # Editable install with no version control (proteinrl==0.0.1)
--e /Users/sohammirajkar/Developer/proteinrl-db
+
 proto-plus==1.26.1
 protobuf==4.25.8
 psutil @ file:///Users/cbousseau/work/recipes/ci_py311_2/psutil_1678995687212/work
