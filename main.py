@@ -14,8 +14,11 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# --- ADD THIS BLOCK ---
-# This tells FastAPI: "If someone asks for /public, look in the 'public' folder"
+# --- SAFE MOUNT ---
+# Ensure the directory exists before mounting to prevent crash
+if not os.path.exists("public"):
+    os.makedirs("public")
+
 app.mount("/public", StaticFiles(directory="public"), name="public")
 # ----------------------
 
