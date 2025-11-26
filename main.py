@@ -14,18 +14,23 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# --- CRASH PROOF MOUNT ---
-# 1. Get the absolute path to the folder (safer for cloud environments)
-script_dir = os.path.dirname(__file__)
-public_path = os.path.join(script_dir, "public")
+# --- ROBUST MOUNTING STRATEGY ---
+try:
+    # 1. Get absolute path to the 'public' folder (works better in cloud)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    public_path = os.path.join(script_dir, "public")
 
-# 2. Create directory if it doesn't exist (prevents Startup Crash)
-if not os.path.exists(public_path):
-    os.makedirs(public_path)
+    # 2. Check if it exists. If not, log a warning but DO NOT CRASH.
+    if os.path.exists(public_path):
+        app.mount("/public", StaticFiles(directory=public_path), name="public")
+        logger.info(f"✅ Mounted public folder at: {public_path}")
+    else:
+        logger.warning(
+            f"⚠️ Public folder not found at {public_path}. Dashboard will be unavailable, but API will survive.")
 
-# 3. Mount it
-app.mount("/public", StaticFiles(directory=public_path), name="public")
-# -------------------------
+except Exception as e:
+    logger.error(f"❌ Failed to mount public folder: {str(e)}")
+# -------------------------------
 
 # CORS
 app.add_middleware(
