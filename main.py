@@ -1,17 +1,15 @@
-import os
 import logging
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles  # <--- Crucial for the dashboard
+from fastapi.responses import HTMLResponse  # <--- NEW
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from database import SessionLocal, engine, Base
 from models import TradeLogDB, TelemetryDB
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
 
-# --- LOGGING SETUP ---
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn")
 
@@ -29,27 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- ROBUST PUBLIC FOLDER MOUNTING ---
-try:
-    # 1. Get absolute path to the 'public' folder
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    public_path = os.path.join(script_dir, "public")
-
-    # 2. Check if it exists. If not, create it to prevent crash.
-    if not os.path.exists(public_path):
-        os.makedirs(public_path)
-        logger.info(f"📁 Created missing public directory at: {public_path}")
-
-    # 3. Mount it
-    app.mount("/public", StaticFiles(directory=public_path), name="public")
-    logger.info(f"✅ Mounted public folder at: {public_path}")
-
-except Exception as e:
-    # If this fails, log it but let the API start
-    logger.error(f"❌ Failed to mount public folder: {str(e)}")
-
-
 # --- DEPENDENCIES ---
+
 
 def get_db():
     db = SessionLocal()
@@ -83,6 +62,91 @@ class TelemetryPayload(BaseModel):
     slippage: float
     status: str
 
+
+# --- DASHBOARD HTML (EMBEDDED) ---
+# This bypasses all file system errors
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Global Algo Execution Leaderboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #020617; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+        .rank-1 { border-left: 4px solid #22c55e; background: linear-gradient(90deg, #14532d 0%, #1e293b 100%); }
+        .rank-low { border-left: 4px solid #ef4444; }
+    </style>
+</head>
+<body class="p-8">
+    <div class="max-w-4xl mx-auto">
+        <div class="text-center mb-10">
+            <h1 class="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400 mb-4">
+                Global Execution Monitor
+            </h1>
+            <p class="text-xl text-gray-400">Real-time latency & slippage data from <span id="activeNodes" class="text-white font-bold">--</span> active algo traders.</p>
+            <div class="mt-6">
+                <a href="https://github.com/yourusername/pnl-watchdog" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-lg font-bold transition">
+                    Join the Network (Install Library)
+                </a>
+            </div>
+        </div>
+        <div class="space-y-4" id="leaderboard">
+            <div class="text-center text-gray-500 animate-pulse">Scanning Global Network...</div>
+        </div>
+    </div>
+    <script>
+        async function loadLeaderboard() {
+            // Point to the relative API endpoint
+            const res = await fetch('/v1/global_status');
+            const data = await res.json();
+            
+            const container = document.getElementById('leaderboard');
+            container.innerHTML = '';
+            let totalNodes = 0;
+
+            data.forEach((row, index) => {
+                totalNodes += row.volume;
+                const isTop = index === 0;
+                const isLow = row.score < 50;
+                
+                const html = `
+                    <div class="p-6 rounded-lg flex items-center justify-between bg-slate-800 border border-slate-700 ${isTop ? 'rank-1 shadow-lg shadow-green-900/20' : ''} ${isLow ? 'rank-low' : ''}">
+                        <div class="flex items-center gap-4">
+                            <div class="text-2xl font-bold text-gray-500">#${index + 1}</div>
+                            <div>
+                                <h3 class="text-2xl font-bold text-white capitalize">${row.broker}</h3>
+                                <div class="flex gap-2 mt-1">
+                                    <span class="text-xs bg-slate-700 px-2 py-1 rounded text-gray-300">Score: ${row.score}/100</span>
+                                    ${isTop ? '<span class="text-xs bg-green-900 text-green-300 px-2 py-1 rounded">🏆 Fastest Execution</span>' : ''}
+                                    ${isLow ? '<span class="text-xs bg-red-900 text-red-300 px-2 py-1 rounded">⚠️ Congested</span>' : ''}
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex gap-8 text-right">
+                            <div>
+                                <div class="text-xs text-gray-400 uppercase font-bold">Latency</div>
+                                <div class="text-xl font-mono ${row.latency < 50 ? 'text-green-400' : 'text-yellow-400'}">${row.latency}ms</div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-400 uppercase font-bold">Avg Slippage</div>
+                                <div class="text-xl font-mono text-white">${row.slippage}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML += html;
+            });
+            document.getElementById('activeNodes').innerText = totalNodes;
+        }
+        loadLeaderboard();
+        setInterval(loadLeaderboard, 5000);
+    </script>
+</body>
+</html>
+"""
+
 # --- ENDPOINTS ---
 
 
@@ -90,14 +154,18 @@ class TelemetryPayload(BaseModel):
 async def root():
     return {"status": "online", "service": "PnL Global Oracle"}
 
+# NEW: Serve Dashboard directly from Memory
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return DASHBOARD_HTML
+
 # 1. THE PUBLIC "WAZE" ENDPOINT (Anonymous)
 
 
 @app.post("/v1/telemetry")
 async def submit_telemetry(payload: TelemetryPayload, db: Session = Depends(get_db)):
-    """
-    Free users send data here. No API Key required.
-    """
     try:
         new_ping = TelemetryDB(
             broker=payload.broker.lower(),
@@ -117,12 +185,7 @@ async def submit_telemetry(payload: TelemetryPayload, db: Session = Depends(get_
 
 @app.get("/v1/global_status")
 async def get_global_map(db: Session = Depends(get_db)):
-    """
-    Returns the 'Traffic Light' status for every broker based on 
-    data from the last 5 minutes.
-    """
     five_mins_ago = datetime.utcnow() - timedelta(minutes=5)
-
     stats = db.query(
         TelemetryDB.broker,
         func.avg(TelemetryDB.latency_ms).label("avg_lat"),
@@ -133,14 +196,11 @@ async def get_global_map(db: Session = Depends(get_db)):
     ).group_by(TelemetryDB.broker).all()
 
     leaderboard = []
-
     for broker, avg_lat, avg_slip, volume in stats:
         lat = float(avg_lat) if avg_lat else 0.0
         slip = float(avg_slip) if avg_slip else 0.0
-
         score = 100 - (lat / 10) - (slip * 1000)
         score = int(max(0, min(100, score)))
-
         health = "green"
         if lat > 500:
             health = "red"
@@ -148,17 +208,12 @@ async def get_global_map(db: Session = Depends(get_db)):
             health = "yellow"
 
         leaderboard.append({
-            "broker": broker,
-            "status": health,
-            "score": score,
-            "latency": int(lat),
-            "slippage": float(f"{slip:.5f}"),
-            "volume": volume
+            "broker": broker, "status": health, "score": score,
+            "latency": int(lat), "slippage": float(f"{slip:.5f}"), "volume": volume
         })
-
     return sorted(leaderboard, key=lambda x: x['score'], reverse=True)
 
-# 3. THE PRO ENDPOINTS (Private)
+# 3. PRO ENDPOINTS
 
 
 @app.get("/v1/logs")
