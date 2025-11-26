@@ -1,5 +1,8 @@
+import os
+import logging
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles  # <--- Crucial for the dashboard
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -7,32 +10,17 @@ from database import SessionLocal, engine, Base
 from models import TradeLogDB, TelemetryDB
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
-from fastapi.staticfiles import StaticFiles
+
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("uvicorn")
 
 # Initialize Database
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# --- ROBUST MOUNTING STRATEGY ---
-try:
-    # 1. Get absolute path to the 'public' folder (works better in cloud)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    public_path = os.path.join(script_dir, "public")
-
-    # 2. Check if it exists. If not, log a warning but DO NOT CRASH.
-    if os.path.exists(public_path):
-        app.mount("/public", StaticFiles(directory=public_path), name="public")
-        logger.info(f"✅ Mounted public folder at: {public_path}")
-    else:
-        logger.warning(
-            f"⚠️ Public folder not found at {public_path}. Dashboard will be unavailable, but API will survive.")
-
-except Exception as e:
-    logger.error(f"❌ Failed to mount public folder: {str(e)}")
-# -------------------------------
-
-# CORS
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,8 +29,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DEPENDENCIES ---
+# --- ROBUST PUBLIC FOLDER MOUNTING ---
+try:
+    # 1. Get absolute path to the 'public' folder
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    public_path = os.path.join(script_dir, "public")
 
+    # 2. Check if it exists. If not, create it to prevent crash.
+    if not os.path.exists(public_path):
+        os.makedirs(public_path)
+        logger.info(f"📁 Created missing public directory at: {public_path}")
+
+    # 3. Mount it
+    app.mount("/public", StaticFiles(directory=public_path), name="public")
+    logger.info(f"✅ Mounted public folder at: {public_path}")
+
+except Exception as e:
+    # If this fails, log it but let the API start
+    logger.error(f"❌ Failed to mount public folder: {str(e)}")
+
+
+# --- DEPENDENCIES ---
 
 def get_db():
     db = SessionLocal()
@@ -91,15 +98,19 @@ async def submit_telemetry(payload: TelemetryPayload, db: Session = Depends(get_
     """
     Free users send data here. No API Key required.
     """
-    new_ping = TelemetryDB(
-        broker=payload.broker.lower(),
-        latency_ms=payload.latency_ms,
-        slippage=payload.slippage,
-        status=payload.status
-    )
-    db.add(new_ping)
-    db.commit()
-    return {"status": "contributed"}
+    try:
+        new_ping = TelemetryDB(
+            broker=payload.broker.lower(),
+            latency_ms=payload.latency_ms,
+            slippage=payload.slippage,
+            status=payload.status
+        )
+        db.add(new_ping)
+        db.commit()
+        return {"status": "contributed"}
+    except Exception as e:
+        logger.error(f"Error saving telemetry: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 # 2. THE GLOBAL MAP (Aggregated Stats)
 
@@ -112,7 +123,6 @@ async def get_global_map(db: Session = Depends(get_db)):
     """
     five_mins_ago = datetime.utcnow() - timedelta(minutes=5)
 
-    # SQL: SELECT broker, AVG(lat), AVG(slip), COUNT(*)
     stats = db.query(
         TelemetryDB.broker,
         func.avg(TelemetryDB.latency_ms).label("avg_lat"),
@@ -124,18 +134,13 @@ async def get_global_map(db: Session = Depends(get_db)):
 
     leaderboard = []
 
-    # Fix: Correctly unpack all 4 values returned by the query
     for broker, avg_lat, avg_slip, volume in stats:
-
-        # Handle potential None values if averages fail
         lat = float(avg_lat) if avg_lat else 0.0
         slip = float(avg_slip) if avg_slip else 0.0
 
-        # Calculate Health Score (0-100)
         score = 100 - (lat / 10) - (slip * 1000)
         score = int(max(0, min(100, score)))
 
-        # Determine Traffic Light Status based on Latency
         health = "green"
         if lat > 500:
             health = "red"
@@ -151,7 +156,6 @@ async def get_global_map(db: Session = Depends(get_db)):
             "volume": volume
         })
 
-    # Return sorted list for the frontend to render
     return sorted(leaderboard, key=lambda x: x['score'], reverse=True)
 
 # 3. THE PRO ENDPOINTS (Private)
