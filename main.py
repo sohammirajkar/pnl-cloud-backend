@@ -303,3 +303,90 @@ async def get_global_map(db: Session = Depends(get_db)):
         })
 
     return sorted(results, key=lambda x: x['p99'])
+
+# --- ORACLE ROUTING ENGINE (The "Waze" Logic) ---
+
+
+class RoutingRequest(BaseModel):
+    symbol: str
+    size: float
+    # "normal" or "high" (High urgency ignores risk for speed)
+    urgency: str = "normal"
+
+
+@app.post("/v1/oracle/route")
+async def get_smart_route(req: RoutingRequest, user_id: str = Depends(verify_key), db: Session = Depends(get_db)):
+    """
+    The 'Waze' API: Tells the bot exactly where to route the trade.
+    Monetization: Only available to Pro Users (valid API Key).
+    """
+    # 1. Get Live Data (Last 2 minutes)
+    since = datetime.utcnow() - timedelta(minutes=2)
+    raw = db.query(TelemetryDB).filter(TelemetryDB.timestamp >= since).all()
+
+    # 2. Group & Analyze
+    candidates = {}
+    for r in raw:
+        if r.broker not in candidates:
+            candidates[r.broker] = []
+        candidates[r.broker].append(r.latency_ms)
+
+    scored_brokers = []
+
+    for broker, lats in candidates.items():
+        if len(lats) < 3:
+            continue  # Not enough data to trust
+
+        # Calculate Metrics
+        avg_lat = statistics.mean(lats)
+        jitter = np.std(lats)
+        hurst = calculate_hurst(lats)
+        p99 = np.percentile(lats, 99)
+
+        # 3. The Scoring Algorithm
+        # Lower score is better.
+        score = avg_lat + (jitter * 2)
+
+        # PENALTIES
+        risk_flags = []
+
+        # A. Non-Ergodic Penalty (Hurst > 0.5 means "Cluster Risk")
+        if hurst > 0.6:
+            score += 200
+            risk_flags.append("Unstable (High Hurst)")
+
+        # B. Fat Tail Penalty
+        if p99 > (avg_lat * 3):
+            score += 100
+            risk_flags.append("Fat Tail Risk")
+
+        # C. Urgency Logic
+        # If urgency is HIGH, we forgive Jitter but punish pure Latency
+        if req.urgency == "high":
+            score = avg_lat  # Pure speed
+
+        scored_brokers.append({
+            "broker": broker,
+            "score": int(score),
+            "latency_ms": int(avg_lat),
+            "risk_flags": risk_flags
+        })
+
+    # 4. Sort by Best Score
+    scored_brokers.sort(key=lambda x: x['score'])
+
+    if not scored_brokers:
+        return {"status": "no_data", "recommendation": None}
+
+    best = scored_brokers[0]
+
+    # 5. The Recommendation
+    return {
+        "status": "optimized",
+        "recommendation": best["broker"],
+        "metrics": {
+            "expected_latency": best["latency_ms"],
+            "risk_factors": best["risk_flags"]
+        },
+        "alternatives": scored_brokers[1:3]
+    }
