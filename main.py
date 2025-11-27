@@ -1,6 +1,7 @@
 import logging
 import statistics
 import math
+import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -11,16 +12,12 @@ from database import SessionLocal, engine, Base
 from models import TradeLogDB, TelemetryDB
 from datetime import datetime, timedelta
 
-# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn")
 
-# Initialize Database
 Base.metadata.create_all(bind=engine)
-
 app = FastAPI()
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,6 +25,174 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- QUANT FUNCTIONS ---
+
+
+def calculate_hurst(ts):
+    """
+    Estimates Hurst Exponent (H) for a time series.
+    H < 0.5: Mean Reverting (Safe)
+    H ~ 0.5: Random Walk
+    H > 0.5: Persistent (Trend/Dangerous behavior in latency)
+    """
+    if len(ts) < 20:
+        return 0.5  # Not enough data
+
+    lags = range(2, min(20, len(ts)//2))
+    tau = [np.std(np.subtract(ts[lag:], ts[:-lag])) for lag in lags]
+
+    # Avoid log(0) errors
+    tau = [t if t > 0 else 1e-6 for t in tau]
+
+    # Slope of log-log plot
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0] * 2.0  # H approximation
+
+
+# --- DASHBOARD HTML (With Heatmap & Math) ---
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PnL Risk Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #0b0e14; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+        .card { background: #151b28; border: 1px solid #2d3748; }
+        .metric-val { font-family: 'JetBrains Mono', monospace; }
+        .heatmap-cell { width: 100%; height: 20px; border-radius: 2px; }
+    </style>
+</head>
+<body class="p-6">
+    <div class="max-w-6xl mx-auto">
+        <header class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400">
+                    PnL Risk Engine
+                </h1>
+                <p class="text-sm text-gray-500 mt-1">Institutional Execution Analytics</p>
+            </div>
+            <div class="text-right">
+                <div class="text-xs text-gray-500 uppercase tracking-wider">System Status</div>
+                <div class="text-green-400 font-bold flex items-center gap-2 justify-end">
+                    <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span> ONLINE
+                </div>
+            </div>
+        </header>
+
+        <div class="card rounded-xl p-6 mb-8">
+            <h2 class="text-sm font-bold text-gray-400 uppercase mb-4 tracking-wider">Liquidity Hole Heatmap (Real-time)</h2>
+            <div id="heatmapGrid" class="space-y-2">
+                </div>
+        </div>
+
+        <div id="riskCards" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            </div>
+
+    </div>
+
+    <script>
+        function getRiskColor(score) {
+            if(score > 70) return 'text-red-500';
+            if(score > 40) return 'text-yellow-500';
+            return 'text-green-500';
+        }
+
+        function getHurstLabel(h) {
+            if(h > 0.6) return {text: "PERSISTENT (RISK)", color: "text-red-400"};
+            if(h < 0.4) return {text: "MEAN REVERTING", color: "text-green-400"};
+            return {text: "RANDOM WALK", color: "text-gray-400"};
+        }
+
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/v1/global_status');
+                const data = await res.json();
+                
+                // 1. Update Heatmap
+                const heatmap = document.getElementById('heatmapGrid');
+                heatmap.innerHTML = '';
+                
+                data.forEach(broker => {
+                    // Create row
+                    const row = document.createElement('div');
+                    row.className = 'flex items-center gap-4';
+                    
+                    // Label
+                    const label = document.createElement('div');
+                    label.className = 'w-24 text-xs font-bold text-gray-400 uppercase text-right';
+                    label.innerText = broker.broker;
+                    
+                    // Cells (We visualize the history array)
+                    const cellsContainer = document.createElement('div');
+                    cellsContainer.className = 'flex-1 flex gap-1';
+                    
+                    broker.history.slice(-30).forEach(lat => {
+                        const cell = document.createElement('div');
+                        cell.className = 'flex-1 h-6 rounded-sm transition-all';
+                        
+                        // Heatmap Color Logic
+                        if(lat < 50) cell.style.backgroundColor = '#10b981'; // Green
+                        else if(lat < 150) cell.style.backgroundColor = '#f59e0b'; // Yellow
+                        else if(lat < 500) cell.style.backgroundColor = '#ef4444'; // Red
+                        else cell.style.backgroundColor = '#7f1d1d'; // Dark Red (Death Spiral)
+                        
+                        cellsContainer.appendChild(cell);
+                    });
+                    
+                    row.appendChild(label);
+                    row.appendChild(cellsContainer);
+                    heatmap.appendChild(row);
+                });
+
+                // 2. Update Cards
+                const cards = document.getElementById('riskCards');
+                cards.innerHTML = '';
+                
+                data.forEach(b => {
+                    const hurstInfo = getHurstLabel(b.hurst);
+                    
+                    const html = `
+                    <div class="card rounded-xl p-5 hover:border-blue-500/50 transition">
+                        <div class="flex justify-between items-start mb-4">
+                            <div>
+                                <h3 class="text-xl font-bold text-white capitalize">${b.broker}</h3>
+                                <div class="text-xs ${hurstInfo.color} font-bold mt-1 tracking-wide border border-gray-700 inline-block px-2 py-0.5 rounded">H=${b.hurst.toFixed(2)}: ${hurstInfo.text}</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-2xl font-black metric-val ${b.p99 > 300 ? 'text-red-500' : 'text-gray-200'}">${b.p99}ms</div>
+                                <div class="text-[10px] text-gray-500 uppercase">P99 Latency</div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-4 mt-6 border-t border-gray-800 pt-4">
+                            <div>
+                                <div class="text-[10px] text-gray-500 uppercase font-bold">Jitter (σ)</div>
+                                <div class="text-sm font-mono text-gray-300">±${b.jitter}ms</div>
+                            </div>
+                            <div>
+                                <div class="text-[10px] text-gray-500 uppercase font-bold">Systemic Corr</div>
+                                <div class="text-sm font-mono text-blue-300">${(b.correlation * 100).toFixed(0)}%</div>
+                            </div>
+                        </div>
+                    </div>
+                    `;
+                    cards.innerHTML += html;
+                });
+
+            } catch(e) { console.error(e); }
+        }
+
+        setInterval(updateDashboard, 2000);
+        updateDashboard();
+    </script>
+</body>
+</html>
+"""
 
 # --- DEPENDENCIES ---
 
@@ -45,7 +210,7 @@ async def verify_key(x_pro_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return x_pro_key.split('_')[-1]
 
-# --- DATA MODELS ---
+# --- MODELS ---
 
 
 class TradeLog(BaseModel):
@@ -64,151 +229,16 @@ class TelemetryPayload(BaseModel):
     slippage: float
     status: str
 
-
-# --- RISK-AWARE DASHBOARD HTML ---
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Global Execution Risk Monitor</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background-color: #020617; color: #e2e8f0; font-family: 'Inter', sans-serif; }
-        .rank-1 { border-left: 4px solid #22c55e; background: linear-gradient(90deg, #14532d 0%, #1e293b 100%); }
-        .rank-danger { border-left: 4px solid #ef4444; background: linear-gradient(90deg, #450a0a 0%, #1e293b 100%); }
-        .metric-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; }
-        .risk-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-        .glitch { animation: glitch 1s linear infinite; }
-        @keyframes glitch {
-            2%, 64% { transform: translate(2px,0) skew(0deg); }
-            4%, 60% { transform: translate(-2px,0) skew(0deg); }
-            62% { transform: translate(0,0) skew(5deg); }
-        }
-    </style>
-</head>
-<body class="p-4 md:p-8">
-    <div class="max-w-5xl mx-auto">
-        <div class="text-center mb-10">
-            <h1 class="text-4xl md:text-5xl font-black text-white mb-2 tracking-tight">
-                <span class="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">PnL Watchdog</span> Risk Map
-            </h1>
-            <p class="text-lg text-gray-400">Monitoring <span id="activeNodes" class="text-white font-bold">--</span> nodes for Fat Tail events.</p>
-            
-            <div class="mt-6 flex justify-center gap-4">
-                <a href="https://github.com/sohammirajkar/pnl-cloud-backend" target="_blank" class="bg-slate-800 border border-slate-700 hover:border-blue-500 text-white px-4 py-2 rounded-lg text-sm font-semibold transition">
-                    View Source
-                </a>
-                <div class="bg-blue-600/20 border border-blue-500/50 text-blue-200 px-4 py-2 rounded-lg text-sm">
-                    pip install pnl-watchdog==0.3.2
-                </div>
-            </div>
-        </div>
-
-        <div class="flex justify-center gap-6 mb-6 text-xs text-gray-500">
-            <div class="flex items-center gap-2">
-                <div class="w-3 h-3 bg-green-500 rounded-full"></div> Ergodic (Safe)
-            </div>
-            <div class="flex items-center gap-2">
-                <div class="w-3 h-3 bg-red-500 rounded-full"></div> Non-Ergodic (Fat Tail Risk)
-            </div>
-        </div>
-
-        <div class="space-y-4" id="leaderboard">
-            <div class="text-center text-gray-500 animate-pulse mt-10">Calculating Risk Metrics...</div>
-        </div>
-    </div>
-
-    <script>
-        async function loadLeaderboard() {
-            try {
-                const res = await fetch('/v1/global_status');
-                const data = await res.json();
-                
-                const container = document.getElementById('leaderboard');
-                container.innerHTML = '';
-                let totalNodes = 0;
-
-                data.forEach((row, index) => {
-                    totalNodes += row.volume;
-                    const isSafe = row.risk_score < 30;
-                    const isDangerous = row.risk_score > 70;
-                    
-                    // Determine CSS class
-                    let cardClass = "bg-slate-800 border-slate-700";
-                    if (index === 0 && isSafe) cardClass = "rank-1 shadow-lg shadow-green-900/20 border-green-800";
-                    if (isDangerous) cardClass = "rank-danger border-red-900";
-
-                    const html = `
-                        <div class="p-5 rounded-lg border ${cardClass} transition hover:scale-[1.01]">
-                            <div class="flex flex-col md:flex-row items-center justify-between gap-4">
-                                <div class="flex items-center gap-4 w-full md:w-1/3">
-                                    <div class="text-xl font-bold text-slate-600">#${index + 1}</div>
-                                    <div>
-                                        <h3 class="text-xl font-bold text-white capitalize flex items-center gap-2">
-                                            ${row.broker}
-                                            ${isDangerous ? '<span class="risk-badge bg-red-900 text-red-200">FAT TAIL RISK</span>' : ''}
-                                            ${index === 0 ? '<span class="risk-badge bg-green-900 text-green-200">BEST EXECUTION</span>' : ''}
-                                        </h3>
-                                        <div class="text-xs text-gray-400 mt-1">Based on ${row.volume} recent trades</div>
-                                    </div>
-                                </div>
-
-                                <div class="grid grid-cols-4 gap-4 w-full md:w-2/3">
-                                    
-                                    <div class="text-center">
-                                        <div class="metric-label">Avg Speed</div>
-                                        <div class="text-lg font-mono text-white">${row.avg_lat}ms</div>
-                                    </div>
-
-                                    <div class="text-center border-l border-slate-700">
-                                        <div class="metric-label text-yellow-500 font-bold">P99 (Tail)</div>
-                                        <div class="text-lg font-mono ${row.p99_lat > 200 ? 'text-red-400 font-bold' : 'text-yellow-200'}">
-                                            ${row.p99_lat}ms
-                                        </div>
-                                    </div>
-
-                                    <div class="text-center border-l border-slate-700">
-                                        <div class="metric-label">Jitter (σ)</div>
-                                        <div class="text-lg font-mono text-gray-300">±${row.jitter}ms</div>
-                                    </div>
-
-                                    <div class="text-center border-l border-slate-700">
-                                        <div class="metric-label">Slippage</div>
-                                        <div class="text-lg font-mono ${row.avg_slip > 0.01 ? 'text-red-400' : 'text-emerald-400'}">
-                                            ${row.avg_slip}%
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                    container.innerHTML += html;
-                });
-                document.getElementById('activeNodes').innerText = totalNodes;
-            } catch (err) {
-                console.error("Failed to load map", err);
-            }
-        }
-        loadLeaderboard();
-        setInterval(loadLeaderboard, 3000);
-    </script>
-</body>
-</html>
-"""
-
 # --- ENDPOINTS ---
 
 
-@app.get("/")
-async def root():
-    return {"status": "online", "service": "PnL Risk Oracle"}
+@app.get("/", response_class=HTMLResponse)
+# Set dashboard as ROOT for easy access
+async def root(): return DASHBOARD_HTML
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    return DASHBOARD_HTML
+async def dashboard(): return DASHBOARD_HTML
 
 
 @app.post("/v1/telemetry")
@@ -222,95 +252,54 @@ async def submit_telemetry(payload: TelemetryPayload, db: Session = Depends(get_
         )
         db.add(new_ping)
         db.commit()
-        return {"status": "contributed"}
-    except Exception as e:
-        logger.error(f"Error saving telemetry: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
-
-# --- THE RISK ENGINE (Advanced Math) ---
+        return {"status": "ok"}
+    except:
+        return {"status": "error"}
 
 
 @app.get("/v1/global_status")
 async def get_global_map(db: Session = Depends(get_db)):
-    """
-    Calculates P99 (Tail Risk), Jitter (StdDev), and Average.
-    """
-    # 1. Fetch RAW data from last 5 minutes (needed for P99/StdDev calc)
-    five_mins_ago = datetime.utcnow() - timedelta(minutes=5)
-
-    # We fetch raw rows instead of SQL aggregation to perform P99 math in Python
-    # (More flexible for 'Fat Tail' detection)
-    raw_data = db.query(TelemetryDB).filter(
-        TelemetryDB.timestamp >= five_mins_ago).all()
+    # 1. Fetch recent data (last 2 minutes is enough for "Live" view)
+    since = datetime.utcnow() - timedelta(minutes=2)
+    raw = db.query(TelemetryDB).filter(TelemetryDB.timestamp >= since).all()
 
     # 2. Group by Broker
-    broker_stats = {}
-    for row in raw_data:
-        if row.broker not in broker_stats:
-            broker_stats[row.broker] = {"lats": [], "slips": []}
-        broker_stats[row.broker]["lats"].append(row.latency_ms)
-        broker_stats[row.broker]["slips"].append(row.slippage)
+    data = {}
+    for r in raw:
+        if r.broker not in data:
+            data[r.broker] = []
+        data[r.broker].append(r.latency_ms)
 
-    leaderboard = []
+    # 3. Calculate Global Average (for Correlation)
+    all_latencies = [r.latency_ms for r in raw]
+    global_avg = statistics.mean(all_latencies) if all_latencies else 0
 
-    # 3. Calculate Risk Metrics
-    for broker, data in broker_stats.items():
-        lats = data["lats"]
-        slips = data["slips"]
+    results = []
+    for broker, lats in data.items():
+        if len(lats) < 5:
+            continue
 
-        count = len(lats)
-        if count < 2:
-            continue  # Need at least 2 points for stats
+        # A. Hurst Exponent
+        hurst = calculate_hurst(lats)
 
-        # A. Basic Stats
-        avg_lat = statistics.mean(lats)
-        avg_slip = statistics.mean(slips)
+        # B. Risk Metrics
+        p99 = np.percentile(lats, 99)
+        jitter = np.std(lats)
 
-        # B. Jitter (Standard Deviation) - "How unstable is it?"
-        jitter = statistics.stdev(lats) if count > 1 else 0
+        # C. "Systemic Correlation" (Simple Proxy)
+        # Does this broker deviate from the global average?
+        # If correlation is high, they are systemic.
+        # (Simplified to relative strength for performance)
+        avg = statistics.mean(lats)
+        correlation = min(1.0, avg / (global_avg + 1))
 
-        # C. P99 (Tail Risk) - "What is the worst 1% case?"
-        lats.sort()
-        p99_index = int(count * 0.99)
-        p99_lat = lats[min(p99_index, count - 1)]
-
-        # D. Risk Score Algorithm (Power Law Detection)
-        # If P99 is > 3x the Average, it's a Fat Tail event.
-        fat_tail_ratio = p99_lat / (avg_lat + 1)  # +1 to avoid div by zero
-
-        # Base score (Lower is better)
-        risk_score = (avg_lat * 0.4) + (jitter * 0.3) + \
-            (p99_lat * 0.3) + (avg_slip * 5000)
-
-        # Penalty for Fat Tails
-        if fat_tail_ratio > 3.0:
-            risk_score += 50  # Massive penalty for non-ergodic behavior
-
-        leaderboard.append({
+        results.append({
             "broker": broker,
-            "avg_lat": int(avg_lat),
-            "p99_lat": int(p99_lat),
+            "p99": int(p99),
             "jitter": int(jitter),
-            "avg_slip": float(f"{avg_slip:.5f}"),
-            "volume": count,
-            "risk_score": int(risk_score)
+            "hurst": hurst,
+            "correlation": correlation,
+            "history": lats[-30:]  # Send last 30 points for Heatmap
         })
 
-    # Sort by Risk Score (Lowest Risk First)
-    return sorted(leaderboard, key=lambda x: x['risk_score'])
-
-# --- PRO ENDPOINTS ---
-
-
-@app.get("/v1/logs")
-async def get_logs(user_id: str = Depends(verify_key), limit: int = 50, db: Session = Depends(get_db)):
-    return db.query(TradeLogDB).filter(TradeLogDB.user_id == user_id).order_by(TradeLogDB.timestamp.desc()).limit(limit).all()
-
-
-@app.post("/v1/log_trade")
-async def log_trade(log: TradeLog, user_id: str = Depends(verify_key), db: Session = Depends(get_db)):
-    new_log = TradeLogDB(user_id=user_id, **log.dict())
-    db.add(new_log)
-    db.commit()
-    db.refresh(new_log)
-    return {"success": True, "log_id": new_log.id}
+    return sorted(results, key=lambda x: x['p99'])
