@@ -1,6 +1,7 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean
 from database import Base
 from datetime import datetime
+from sqlalchemy.sql import func
 
 
 class TradeLogDB(Base):
@@ -39,3 +40,14 @@ class TelemetryDB(Base):
     slippage = Column(Float)
     status = Column(String)             # "verified" or "anomaly"
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class ApiKeyDB(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key_hash = Column(String, unique=True, index=True)  # Store HASH only
+    user_id = Column(String, index=True)                # Link to their UUID
+    owner_name = Column(String)                         # "Petio Petrov"
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

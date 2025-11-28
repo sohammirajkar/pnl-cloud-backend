@@ -11,6 +11,8 @@ from sqlalchemy import func
 from database import SessionLocal, engine, Base
 from models import TradeLogDB, TelemetryDB
 from datetime import datetime, timedelta
+import hashlib
+from models import ApiKeyDB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn")
@@ -228,10 +230,26 @@ def get_db():
         db.close()
 
 
-async def verify_key(x_pro_key: str = Header(None)):
+async def verify_key(x_pro_key: str = Header(None), db: Session = Depends(get_db)):
     if not x_pro_key or not x_pro_key.startswith("sk_"):
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    return x_pro_key.split('_')[-1]
+        raise HTTPException(
+            status_code=401, detail="Missing or Invalid API Key Format")
+
+    # 1. Hash the incoming key
+    incoming_hash = hashlib.sha256(x_pro_key.encode()).hexdigest()
+
+    # 2. Check DB for existence
+    key_record = db.query(ApiKeyDB).filter(
+        ApiKeyDB.key_hash == incoming_hash).first()
+
+    if not key_record:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+
+    if not key_record.is_active:
+        raise HTTPException(status_code=403, detail="API Key Revoked")
+
+    # Return the real User ID linked to this key
+    return key_record.user_id
 
 # --- MODELS ---
 
